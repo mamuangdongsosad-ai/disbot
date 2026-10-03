@@ -1,4 +1,15 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send('Discord bot is running!');
+});
+
+app.listen(port, () => {
+  console.log(`Server is listening on port ${port}`);
+});
 
 // ==========================================
 // [ 1. Global Error Handlers ]
