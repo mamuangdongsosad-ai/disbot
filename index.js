@@ -1,5 +1,6 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 'dotenv'.config({ path: require('path').join(__dirname, '.env')});
+require('dotenv').config({ path: require('path').join(__dirname, '.env')});
 // ==========================================
 // [ 1. Global Error Handlers ]
 // ==========================================
