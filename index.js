@@ -1,6 +1,18 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 'dotenv'.config({ path: require('path').join(__dirname, '.env')});
 require('dotenv').config({ path: require('path').join(__dirname, '.env')});
+console.log('=== bot starting ===', process.version);
+
+// โหลด .env เฉพาะตอนรันในเครื่อง — บนโฮสต์ใช้ Environment variables ของโฮสต์
+// ครอบ try/catch ไว้ ถ้าไม่ได้ติดตั้ง dotenv บนโฮสต์ บอทจะได้ไม่ล้มตั้งแต่บรรทัดแรกๆ
+try {
+    require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+} catch (err) {
+    console.log('ℹ️ ไม่ได้ใช้ dotenv (ใช้ตัวแปรจากโฮสต์แทน):', err.code || err.message);
+}
+console.log('has DISCORD_TOKEN:', !!process.env.DISCORD_TOKEN);
+console.log('has EASYSLIP_API_KEY:', !!process.env.EASYSLIP_API_KEY);
+
 // ==========================================
 // [ 1. Global Error Handlers ]
 // ==========================================
@@ -13,6 +25,7 @@ process.on('uncaughtException',  (err)    => { console.error('💥 Uncaught Exce
 const {
     Client, GatewayIntentBits, Options, ActionRowBuilder, EmbedBuilder,
     PermissionFlagsBits, ButtonBuilder, ButtonStyle
+    PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events
 } = require('discord.js');
 
 const fs    = require('fs');
@@ -456,3 +469,34 @@ client.on('interactionCreate', async (interaction) => {
 // ==========================================
 // ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ในไฟล์ .env เป็น TOKEN=your_token_here
 client.login(process.env.DISCORD_TOKEN);
+// ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ใน .env (ในเครื่อง) หรือ Environment variables (บนโฮสต์) ชื่อ DISCORD_TOKEN
+
+// ถ้าผ่านไป 30 วินาทีแล้วยังไม่ ready ให้เตือนใน Console จะได้ไม่เงียบ
+const loginWatchdog = setTimeout(() => {
+    if (!client.isReady()) {
+        console.error('⏳ ผ่านไป 30 วินาทีแล้วบอทยังไม่ ready — เช็ก token / การเชื่อมต่อเน็ต / Privileged Intents ใน Developer Portal');
+    }
+}, 30 * 1000);
+
+// Events.ClientReady ใช้ได้ทั้ง discord.js v14 รุ่นเก่า ('ready') และรุ่นใหม่ ('clientReady')
+client.once(Events.ClientReady, (c) => {
+    clearTimeout(loginWatchdog);
+    console.log(`✅ Logged in as ${c.user.tag} (ID: ${c.user.id}) — อยู่ใน ${c.guilds.cache.size} เซิร์ฟเวอร์`);
+    console.log(`📦 ข้อมูลที่โหลด: คิวถัดไป #${queueCount}, ตั๋วที่เปิดอยู่ ${Object.keys(activeTicketData).length} ใบ, รีวิว ${reviewCount}`);
+});
+
+client.on('error',      (err)  => console.error('❌ Client error:', err));
+client.on('warn',       (msg)  => console.warn('⚠️ Client warn:', msg));
+client.on('shardError', (err)  => console.error('❌ Shard error:', err));
+
+console.log('🔑 กำลัง login เข้า Discord...');
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+    clearTimeout(loginWatchdog);
+    console.error('❌ Login ไม่สำเร็จ:', err.code || '', err.message);
+    if (err.code === 'TokenInvalid') {
+        console.error('👉 Token ไม่ถูกต้อง: Reset Token ในหน้า Bot แล้ววางใหม่ใน DISCORD_TOKEN (ไม่มีช่องว่าง/เครื่องหมายคำพูด)');
+    } else if (err.code === 'DisallowedIntents') {
+        console.error('👉 ต้องเปิด MESSAGE CONTENT INTENT ในหน้า Bot ของ Developer Portal');
+    }
+    process.exit(1);
+});
