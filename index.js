@@ -1,17 +1,4 @@
-require('dotenv').config({ path: require('path').join(__dirname, '.env') });
-'dotenv'.config({ path: require('path').join(__dirname, '.env')});
-require('dotenv').config({ path: require('path').join(__dirname, '.env')});
-console.log('=== bot starting ===', process.version);
-
-// โหลด .env เฉพาะตอนรันในเครื่อง — บนโฮสต์ใช้ Environment variables ของโฮสต์
-// ครอบ try/catch ไว้ ถ้าไม่ได้ติดตั้ง dotenv บนโฮสต์ บอทจะได้ไม่ล้มตั้งแต่บรรทัดแรกๆ
-try {
-    require('dotenv').config({ path: require('path').join(__dirname, '.env') });
-} catch (err) {
-    console.log('ℹ️ ไม่ได้ใช้ dotenv (ใช้ตัวแปรจากโฮสต์แทน):', err.code || err.message);
-}
-console.log('has DISCORD_TOKEN:', !!process.env.DISCORD_TOKEN);
-console.log('has EASYSLIP_API_KEY:', !!process.env.EASYSLIP_API_KEY);
+require('dotenv').config();
 
 // ==========================================
 // [ 1. Global Error Handlers ]
@@ -23,8 +10,7 @@ process.on('uncaughtException',  (err)    => { console.error('💥 Uncaught Exce
 // [ 2. Imports ]
 // ==========================================
 const {
-    Client, GatewayIntentBits, Options, ActionRowBuilder, EmbedBuilder,
-    PermissionFlagsBits, ButtonBuilder, ButtonStyle
+    Client, GatewayIntentBits, ActionRowBuilder, EmbedBuilder,
     PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events
 } = require('discord.js');
 
@@ -171,24 +157,91 @@ function buildReviewChannelName(currentName, count) {
     return `${currentName}〔${count}〕`;
 }
 
-async function closeTicket(channelId, userId) {
-    const chan = client.channels.cache.get(channelId);
-    if (!chan) return;
-    await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false }).catch(() => {});
-    if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false }).catch(() => {});
+// ── ปิดตั๋ว: รอ 10 นาที แล้วย้ายเข้าหมวดเก็บงาน + ซ่อนห้องจากลูกค้า ──
+const CLOSE_DELAY_MS = 10 * 60 * 1000;
+const closeTimers    = new Map(); // channelId -> timeout
+
+function scheduleClose(channelId, delayMs) {
+    if (closeTimers.has(channelId)) return;
+    const timer = setTimeout(() => {
+        closeTimers.delete(channelId);
+        closeTicket(channelId);
+    }, Math.max(0, delayMs));
+    closeTimers.set(channelId, timer);
+}
+
+async function closeTicket(channelId) {
+    const data   = activeTicketData[channelId];
+    const userId = data?.userId;
+
+    try {
+        const chan = await client.channels.fetch(channelId);
+        await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false });
+        if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false });
+        console.log(`📦 ตั๋ว #${data?.qNum ?? '?'} ย้ายเข้าหมวดเก็บงานและซ่อนจากลูกค้าแล้ว`);
+    } catch (err) {
+        if (err.code !== 10003) { // 10003 = Unknown Channel (ห้องถูกลบไปแล้ว ก็ถือว่าเสร็จ)
+            console.error(`❌ ย้าย/ซ่อนตั๋ว ${channelId} ไม่สำเร็จ (เช็ค DONE_CATEGORY_ID, สิทธิ์ Manage Channels, หมวดเต็ม 50 ห้อง):`, err.message);
+            return; // เก็บข้อมูลไว้ จะลองใหม่ตอนบอทเริ่มรันครั้งถัดไป
+        }
+    }
+
     delete activeTicketData[channelId];
     saveTickets();
+}
+
+// ── เปลี่ยนชื่อห้องรีวิว: Discord จำกัดการเปลี่ยนชื่อห้อง 2 ครั้ง/10 นาที
+//    จึงรวมการเปลี่ยนไว้ทีละครั้ง (เว้นอย่างน้อย 5 นาที) แล้วใช้เลขล่าสุดเสมอ ──
+const REVIEW_RENAME_COOLDOWN = 5 * 60 * 1000;
+let lastReviewRename  = 0;
+let reviewRenameTimer = null;
+
+function scheduleReviewRename() {
+    if (reviewRenameTimer) return; // มีคิวรออยู่แล้ว ตอนยิงจะใช้เลขล่าสุดเอง
+    const wait = Math.max(0, lastReviewRename + REVIEW_RENAME_COOLDOWN - Date.now());
+    reviewRenameTimer = setTimeout(async () => {
+        reviewRenameTimer = null;
+        lastReviewRename  = Date.now();
+        try {
+            const ch      = await client.channels.fetch(REVIEW_CHANNEL_ID);
+            const newName = buildReviewChannelName(ch.name, reviewCount);
+            if (newName !== ch.name) {
+                await ch.setName(newName);
+                console.log(`✏️ เปลี่ยนชื่อห้องรีวิวเป็น ${newName}`);
+            }
+        } catch (err) {
+            console.error('❌ เปลี่ยนชื่อห้องรีวิวไม่ได้ (เช็ค REVIEW_CHANNEL_ID และสิทธิ์ Manage Channels ของบอท):', err.message);
+        }
+    }, wait);
 }
 
 // ==========================================
 // [ 6. Client ]
 // ==========================================
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-    makeCache: Options.cacheWithLimits({
-        ...Options.DefaultMakeCacheSettings,
-        MessageManager: 25
-    })
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
+
+client.once(Events.ClientReady, async () => {
+    console.log(`✅ ล็อกอินแล้ว: ${client.user.tag}`);
+
+    // กู้ตัวจับเวลาปิดตั๋วที่ค้างอยู่ (เผื่อบอทรีสตาร์ทระหว่างรอ 10 นาที)
+    for (const [channelId, data] of Object.entries(activeTicketData)) {
+        if (data.closeAt) scheduleClose(channelId, data.closeAt - Date.now());
+    }
+
+    // ซิงค์เลขรีวิวจากชื่อห้อง (กันนับใหม่จาก 0 ทับเลขเดิม) + ตรวจว่าบอทเข้าถึงห้องรีวิวได้
+    try {
+        const ch = await client.channels.fetch(REVIEW_CHANNEL_ID);
+        const m  = ch.name.match(/〔(\d+)〕/);
+        if (m && parseInt(m[1], 10) > reviewCount) {
+            reviewCount = parseInt(m[1], 10);
+            saveReviewCount();
+        }
+        console.log(`⭐ ห้องรีวิว: ${ch.name} | เลขที่นับอยู่: ${reviewCount}`);
+    } catch (err) {
+        console.error('❌ บอทเข้าถึงห้องรีวิวไม่ได้ — เช็ค REVIEW_CHANNEL_ID ว่าถูกเซิร์ฟเวอร์ และบอทเห็นห้องนี้:', err.message);
+    }
 });
 
 // ==========================================
@@ -196,6 +249,19 @@ const client = new Client({
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
+
+    // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
+    if (message.channel.id === REVIEW_CHANNEL_ID) {
+        if (message.member?.roles.cache.has(ADMIN_ROLE_ID)) {
+            console.log('ℹ️ ข้อความของแอดมินในห้องรีวิว — ไม่นับ');
+        } else {
+            reviewCount++;
+            saveReviewCount();
+            console.log(`⭐ นับรีวิวใหม่ → ${reviewCount}`);
+            scheduleReviewRename();
+            return;
+        }
+    }
 
     // ── คำสั่งแอดมิน (เช็คก่อนเสมอ แม้จะพิมพ์ในห้องตั๋วก็ใช้ได้) ──────
     if (message.content.startsWith('!')) {
@@ -220,7 +286,7 @@ client.on('messageCreate', async (message) => {
 ✨ **กดปุ่มด้านล่างเพื่อเปิดตั๋วได้เลยครับ**
 ╰━━━━━━━━━━━━━━━━━━━━━━╯
 
-🎫 แอดมินเป็นกันเองพร้อมให้บริการค้าบบ`
+🎫 แอดมินจะเข้ามาดูแลและแจ้งยอดชำระเงินให้ในห้องตั๋วของคุณครับ`
                 )
                 .setColor('#00B2FF')
                 .setFooter({ text: 'ระบบร้านค้าอัตโนมัติ' });
@@ -280,23 +346,6 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ สร้าง QR ยอด **${amount.toLocaleString()} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
         }
 
-        return;
-    }
-
-    // ── ระบบนับรีวิว ─────────────────────────────────────────────
-    if (message.channel.id === REVIEW_CHANNEL_ID) {
-        const isAdmin = message.member?.roles.cache.has(ADMIN_ROLE_ID);
-        if (!isAdmin) {
-            reviewCount++;
-            saveReviewCount();
-
-            const newName = buildReviewChannelName(message.channel.name, reviewCount);
-            if (newName !== message.channel.name) {
-                await message.channel.setName(newName).catch(err => {
-                    console.error('⚠️ เปลี่ยนชื่อห้องรีวิวไม่ได้ (อาจติด rate limit ของ Discord):', err.message);
-                });
-            }
-        }
         return;
     }
 
@@ -408,8 +457,8 @@ client.on('interactionCreate', async (interaction) => {
                 .setDescription(`สวัสดีครับ <@${interaction.user.id}>\n\nแจ้งรายละเอียดที่ต้องการได้เลยครับ รอแอดมินเข้ามาดำเนินการและแจ้งยอดชำระให้สักครู่นะครับ`);
 
             const btns = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji('🎀').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('🧸').setStyle(ButtonStyle.Success)
+                new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji('🛠️').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('✅').setStyle(ButtonStyle.Success)
             );
 
             await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
@@ -441,15 +490,22 @@ client.on('interactionCreate', async (interaction) => {
             if (!isAdmin && interaction.user.id !== data.userId)
                 return interaction.reply({ content: '❌ คุณไม่มีสิทธิ์ปิดห้องนี้ครับ', ephemeral: true });
 
+            if (data.closeAt)
+                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอย้ายเข้าหมวดเก็บงานครับ', ephemeral: true });
+
+            // บันทึกเวลาปิดลงไฟล์ก่อน เผื่อบอทรีสตาร์ทระหว่างรอ แล้วตั้งเวลาย้าย+ซ่อน
+            data.closeAt = Date.now() + CLOSE_DELAY_MS;
+            saveTickets();
+            scheduleClose(interaction.channel.id, CLOSE_DELAY_MS);
+
             const embed = new EmbedBuilder()
-                .setColor('#773805').setTitle('✅ ปิดห้องแล้ว')
-                .setDescription(`ห้องนี้ถูกปิดแล้วครับ\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
+                .setColor('#2ECC71').setTitle('✅ ปิดห้องแล้ว')
+                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะย้ายและซ่อนห้องภายใน ${CLOSE_DELAY_MS / 60000} นาที\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
 
             await interaction.message.edit({ components: [] }).catch(() => {});
             await interaction.reply({ embeds: [embed] });
-            await interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
-
-            setTimeout(() => closeTicket(interaction.channel.id, data.userId), 15 * 60 * 1000);
+            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการย้ายห้อง
+            interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
             return;
         }
 
@@ -468,35 +524,4 @@ client.on('interactionCreate', async (interaction) => {
 // [ 8. Login ]
 // ==========================================
 // ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ในไฟล์ .env เป็น TOKEN=your_token_here
-client.login(process.env.DISCORD_TOKEN);
-// ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ใน .env (ในเครื่อง) หรือ Environment variables (บนโฮสต์) ชื่อ DISCORD_TOKEN
-
-// ถ้าผ่านไป 30 วินาทีแล้วยังไม่ ready ให้เตือนใน Console จะได้ไม่เงียบ
-const loginWatchdog = setTimeout(() => {
-    if (!client.isReady()) {
-        console.error('⏳ ผ่านไป 30 วินาทีแล้วบอทยังไม่ ready — เช็ก token / การเชื่อมต่อเน็ต / Privileged Intents ใน Developer Portal');
-    }
-}, 30 * 1000);
-
-// Events.ClientReady ใช้ได้ทั้ง discord.js v14 รุ่นเก่า ('ready') และรุ่นใหม่ ('clientReady')
-client.once(Events.ClientReady, (c) => {
-    clearTimeout(loginWatchdog);
-    console.log(`✅ Logged in as ${c.user.tag} (ID: ${c.user.id}) — อยู่ใน ${c.guilds.cache.size} เซิร์ฟเวอร์`);
-    console.log(`📦 ข้อมูลที่โหลด: คิวถัดไป #${queueCount}, ตั๋วที่เปิดอยู่ ${Object.keys(activeTicketData).length} ใบ, รีวิว ${reviewCount}`);
-});
-
-client.on('error',      (err)  => console.error('❌ Client error:', err));
-client.on('warn',       (msg)  => console.warn('⚠️ Client warn:', msg));
-client.on('shardError', (err)  => console.error('❌ Shard error:', err));
-
-console.log('🔑 กำลัง login เข้า Discord...');
-client.login(process.env.DISCORD_TOKEN).catch((err) => {
-    clearTimeout(loginWatchdog);
-    console.error('❌ Login ไม่สำเร็จ:', err.code || '', err.message);
-    if (err.code === 'TokenInvalid') {
-        console.error('👉 Token ไม่ถูกต้อง: Reset Token ในหน้า Bot แล้ววางใหม่ใน DISCORD_TOKEN (ไม่มีช่องว่าง/เครื่องหมายคำพูด)');
-    } else if (err.code === 'DisallowedIntents') {
-        console.error('👉 ต้องเปิด MESSAGE CONTENT INTENT ในหน้า Bot ของ Developer Portal');
-    }
-    process.exit(1);
-});
+client.login(process.env.DISCORDTOKEN || process.env.TOKEN);
